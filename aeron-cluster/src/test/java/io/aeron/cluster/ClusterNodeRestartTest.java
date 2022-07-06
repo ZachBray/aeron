@@ -21,10 +21,8 @@ import io.aeron.Publication;
 import io.aeron.archive.Archive;
 import io.aeron.archive.ArchiveThreadingMode;
 import io.aeron.cluster.client.AeronCluster;
-import io.aeron.cluster.service.ClientSession;
-import io.aeron.cluster.service.Cluster;
-import io.aeron.cluster.service.ClusteredService;
-import io.aeron.cluster.service.ClusteredServiceContainer;
+import io.aeron.cluster.codecs.CloseReason;
+import io.aeron.cluster.service.*;
 import io.aeron.driver.MediaDriver;
 import io.aeron.driver.ThreadingMode;
 import io.aeron.logbuffer.FragmentHandler;
@@ -37,9 +35,7 @@ import org.agrona.DirectBuffer;
 import org.agrona.ExpandableArrayBuffer;
 import org.agrona.concurrent.status.AtomicCounter;
 import org.agrona.concurrent.status.CountersReader;
-import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.extension.ExtendWith;
 
 import java.io.File;
@@ -48,6 +44,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.zip.CRC32;
 
 import static io.aeron.cluster.ClusterTestConstants.CLUSTER_MEMBERS;
 import static io.aeron.cluster.ClusterTestConstants.INGRESS_ENDPOINTS;
@@ -201,6 +198,122 @@ public class ClusterNodeRestartTest
 
         Tests.await(() -> null != serviceState.get());
         assertEquals("3", serviceState.get());
+
+        ClusterTests.failOnClusterError();
+    }
+
+    @Test
+    @InterruptAfter(10)
+    public void shouldMaintainSessionCollectionOrderAfterLogRecovery()
+    {
+        final AtomicLong serviceMsgCount = new AtomicLong(0);
+        final AtomicLong sessionsOpenedCount = new AtomicLong(0);
+        final AtomicLong sessionsClosedCount = new AtomicLong(0);
+        final AtomicLong sessionsChecksumAfterLastOpen = new AtomicLong(0);
+
+        launchService(serviceMsgCount, sessionsOpenedCount, sessionsClosedCount, sessionsChecksumAfterLastOpen);
+
+        // Open 10 sessions => triggers session map resize in CSA
+        final int firstClientBatchSize = 10; // 10 is greater than Long2ObjectHashMap's default capacity
+        final AeronCluster[] firstBatchOfClients = connectSimultaneousClients(firstClientBatchSize);
+        Tests.awaitValue(sessionsOpenedCount, firstClientBatchSize);
+
+        // Close those sessions
+        CloseHelper.closeAll(firstBatchOfClients);
+        Tests.awaitValue(sessionsClosedCount, firstClientBatchSize);
+
+        // Open more sessions (that will remain after snapshot)
+        final int secondClientBatchSize = 3;
+        final AeronCluster[] secondBatchOfClients = connectSimultaneousClients(secondClientBatchSize);
+        Tests.awaitValue(sessionsOpenedCount, firstClientBatchSize + secondClientBatchSize);
+
+        // Do not take a snapshot (as opposed to test below)
+
+        // Capture checksum of original session order
+        final long sessionChecksumBeforeRecovery = sessionsChecksumAfterLastOpen.get();
+
+        CloseHelper.closeAll(secondBatchOfClients);
+
+        // Recover from snapshot with only 4 sessions => different map capacity to before
+        forceCloseForRestart();
+
+        // Reset counters
+        serviceMsgCount.set(0L);
+        sessionsOpenedCount.set(0L);
+        sessionsClosedCount.set(0L);
+        sessionsChecksumAfterLastOpen.set(0L);
+
+        launchClusteredMediaDriver(false);
+        launchService(serviceMsgCount, sessionsOpenedCount, sessionsClosedCount, sessionsChecksumAfterLastOpen);
+
+        // Await recovery to complete
+        Tests.awaitValue(sessionsOpenedCount, firstClientBatchSize + secondClientBatchSize);
+
+        final long sessionChecksumAfterRecovery = sessionsChecksumAfterLastOpen.get();
+
+        assertEquals(sessionChecksumBeforeRecovery, sessionChecksumAfterRecovery);
+
+        ClusterTests.failOnClusterError();
+    }
+
+    @Test
+    @InterruptAfter(10)
+    @Disabled
+    public void shouldMaintainSessionCollectionOrderAfterSnapshot()
+    {
+        final AtomicLong serviceMsgCount = new AtomicLong(0);
+        final AtomicLong sessionsOpenedCount = new AtomicLong(0);
+        final AtomicLong sessionsClosedCount = new AtomicLong(0);
+        final AtomicLong sessionsChecksumAfterLastOpen = new AtomicLong(0);
+
+        launchService(serviceMsgCount, sessionsOpenedCount, sessionsClosedCount, sessionsChecksumAfterLastOpen);
+
+        // Open 10 sessions => triggers session map resize in CSA
+        final int firstClientBatchSize = 10; // 10 is greater than Long2ObjectHashMap's default capacity
+        final AeronCluster[] firstBatchOfClients = connectSimultaneousClients(firstClientBatchSize);
+        Tests.awaitValue(sessionsOpenedCount, firstClientBatchSize);
+
+        // Close those sessions
+        CloseHelper.closeAll(firstBatchOfClients);
+        Tests.awaitValue(sessionsClosedCount, firstClientBatchSize);
+
+        // Open more sessions (that will remain after snapshot)
+        final int secondClientBatchSize = 3;
+        final AeronCluster[] secondBatchOfClients = connectSimultaneousClients(secondClientBatchSize);
+        Tests.awaitValue(sessionsOpenedCount, firstClientBatchSize + secondClientBatchSize);
+
+        // Take a snapshot
+        final AtomicCounter controlToggle = getControlToggle();
+        assertTrue(ClusterControl.ToggleState.SNAPSHOT.toggle(controlToggle));
+        Tests.awaitValue(clusteredMediaDriver.consensusModule().context().snapshotCounter(), 1);
+
+        // Update checksum when recovering from snapshot + log
+        connectClient();
+        Tests.awaitValue(sessionsOpenedCount, firstClientBatchSize + secondClientBatchSize + 1);
+
+        // Capture checksum of original session order
+        final long sessionChecksumBeforeRecovery = sessionsChecksumAfterLastOpen.get();
+
+        CloseHelper.closeAll(secondBatchOfClients);
+
+        // Recover from snapshot with only 4 sessions => different map capacity to before
+        forceCloseForRestart();
+
+        // Reset counters
+        serviceMsgCount.set(0L);
+        sessionsOpenedCount.set(0L);
+        sessionsClosedCount.set(0L);
+        sessionsChecksumAfterLastOpen.set(0L);
+
+        launchClusteredMediaDriver(false);
+        launchService(serviceMsgCount, sessionsOpenedCount, sessionsClosedCount, sessionsChecksumAfterLastOpen);
+
+        // Await recovery to complete
+        Tests.awaitValue(sessionsOpenedCount, 1);
+
+        final long sessionChecksumAfterRecovery = sessionsChecksumAfterLastOpen.get();
+
+        assertEquals(sessionChecksumBeforeRecovery, sessionChecksumAfterRecovery);
 
         ClusterTests.failOnClusterError();
     }
@@ -471,6 +584,24 @@ public class ClusterNodeRestartTest
 
     private void launchService(final AtomicLong msgCounter)
     {
+        launchService(
+            msgCounter,
+            new AtomicLong(),
+            new AtomicLong(),
+            new AtomicLong()
+        );
+    }
+
+    // TODO refactor to avoid checkstyle issue after review (without noise)
+    // PLAN move anonymous implementation to inner class
+    @SuppressWarnings("checkstyle:MethodLength")
+    private void launchService(
+        final AtomicLong msgCounter,
+        final AtomicLong sessionsOpenedCounter,
+        final AtomicLong sessionsClosedCounter,
+        final AtomicLong sessionsChecksumAfterLastOpen
+    )
+    {
         final ClusteredService service = new StubClusteredService()
         {
             private int nextCorrelationId = 0;
@@ -505,6 +636,21 @@ public class ClusterNodeRestartTest
                         idleStrategy.idle();
                     }
                 }
+            }
+
+            @Override
+            public void onSessionOpen(final ClientSession session, final long timestamp)
+            {
+                super.onSessionOpen(session, timestamp);
+                updateChecksum();
+                sessionsOpenedCounter.incrementAndGet();
+            }
+
+            @Override
+            public void onSessionClose(final ClientSession session, final long timestamp, final CloseReason closeReason)
+            {
+                super.onSessionClose(session, timestamp, closeReason);
+                sessionsClosedCounter.incrementAndGet();
             }
 
             public void onSessionMessage(
@@ -548,6 +694,19 @@ public class ClusterNodeRestartTest
                 length += buffer.putStringAscii(length, Integer.toString(counterValue));
 
                 snapshotPublication.offer(buffer, 0, length);
+            }
+
+            private void updateChecksum()
+            {
+                final CRC32 calculation = new CRC32();
+                for (final ClientSession session : cluster.clientSessions())
+                {
+                    final int hiBits = (int)(session.id() >> 32);
+                    final int loBits = (int)session.id();
+                    calculation.update(hiBits);
+                    calculation.update(loBits);
+                }
+                sessionsChecksumAfterLastOpen.set(calculation.getValue());
             }
         };
 
@@ -639,6 +798,20 @@ public class ClusterNodeRestartTest
         CloseHelper.close(aeronCluster);
         aeronCluster = AeronCluster.connect(
             new AeronCluster.Context().ingressChannel("aeron:udp").ingressEndpoints(INGRESS_ENDPOINTS));
+    }
+
+    private AeronCluster[] connectSimultaneousClients(final int numberOfClients)
+    {
+        final AeronCluster[] aeronClusters = new AeronCluster[numberOfClients];
+        for (int i = 0; i < numberOfClients; i++)
+        {
+            aeronClusters[i] = AeronCluster.connect(
+                new AeronCluster.Context()
+                    .ingressChannel("aeron:udp")
+                    .ingressEndpoints(INGRESS_ENDPOINTS)
+            );
+        }
+        return aeronClusters;
     }
 
     private void launchClusteredMediaDriver(final boolean initialLaunch)
