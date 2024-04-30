@@ -1711,6 +1711,141 @@ class ClusterTest
         }
     }
 
+    @SuppressWarnings("MethodLength")
+    @Test
+    @InterruptAfter(30)
+    void shouldIgnoreChangedTermBufferLengthAndMtu()
+    {
+        final int originalTermLength = 256 * 1024;
+        final int originalMtu = 1408;
+        final int newTermLength = 2 * 1024 * 1024;
+        final int newMtu = 8992;
+        final int staticNodeCount = 3;
+        final CRC32 crc32 = new CRC32();
+
+        cluster = aCluster().withStaticNodes(staticNodeCount)
+            .withLogChannel("aeron:udp?term-length=" + originalTermLength + "|mtu=" + originalMtu)
+            .withIngressChannel("aeron:udp?term-length=" + originalTermLength + "|mtu=" + originalMtu)
+            .withEgressChannel(
+                "aeron:udp?endpoint=localhost:0|term-length=" + originalTermLength + "|mtu=" + originalMtu)
+            .withServiceSupplier(
+                (i) -> new TestNode.TestService[]{ new TestNode.TestService(), new TestNode.ChecksumService() })
+            .start();
+        systemTestWatcher.cluster(cluster);
+
+        final TestNode leader = cluster.awaitLeader();
+        for (int i = 0; i < staticNodeCount; i++)
+        {
+            assertEquals(2, cluster.node(i).services().length);
+        }
+
+        cluster.connectClient();
+        final int firstBatch = 9;
+        int messageLength = computeMaxMessageLength(originalTermLength) - SESSION_HEADER_LENGTH;
+        int payloadLength = messageLength - SIZE_OF_INT;
+        cluster.msgBuffer().setMemory(0, payloadLength, (byte)'x');
+        crc32.reset();
+        crc32.update(cluster.msgBuffer().byteArray(), 0, payloadLength);
+        int msgChecksum = (int)crc32.getValue();
+        cluster.msgBuffer().putInt(payloadLength, msgChecksum, LITTLE_ENDIAN);
+        long checksum = 0;
+        for (int i = 0; i < firstBatch; i++)
+        {
+            cluster.pollUntilMessageSent(messageLength);
+            checksum = Hashing.hash(checksum ^ msgChecksum);
+        }
+        cluster.awaitResponseMessageCount(firstBatch);
+
+        cluster.takeSnapshot(leader);
+        cluster.awaitSnapshotCount(1);
+
+        cluster.msgBuffer().setMemory(0, payloadLength, (byte)'y');
+        crc32.reset();
+        crc32.update(cluster.msgBuffer().byteArray(), 0, payloadLength);
+        msgChecksum = (int)crc32.getValue();
+        cluster.msgBuffer().putInt(payloadLength, msgChecksum, LITTLE_ENDIAN);
+        final int secondBatch = 11;
+        cluster.reconnectClient();
+        for (int i = 0; i < secondBatch; i++)
+        {
+            try
+            {
+                cluster.pollUntilMessageSent(messageLength);
+                checksum = Hashing.hash(checksum ^ msgChecksum);
+            }
+            catch (final ClusterException ex)
+            {
+                throw new RuntimeException("i=" + i, ex);
+            }
+        }
+        cluster.awaitResponseMessageCount(firstBatch + secondBatch);
+
+        cluster.stopAllNodes();
+
+        cluster.logChannel("aeron:udp?term-length=" + newTermLength + "|mtu=" + newMtu);
+        cluster.ingressChannel("aeron:udp?term-length=" + newTermLength + "|mtu=" + newMtu);
+        cluster.egressChannel("aeron:udp?endpoint=localhost:0|term-length=" + newTermLength + "|mtu=" + newMtu);
+
+//        cluster.restartAllNodes(false);
+//        for (int i = 0; i < staticNodeCount; i++)
+//        {
+//            final boolean cleanStart = leader.index() + 1 % staticNodeCount == i;
+//            cluster.startStaticNode(i, cleanStart);
+//        }
+        cluster.startStaticNode(leader.index(), false);
+        cluster.startStaticNode((leader.index() + 1) % staticNodeCount, false);
+
+        cluster.awaitLeader();
+
+        cluster.startStaticNode((leader.index() + 2) % staticNodeCount, true);
+
+        assertEquals(2, cluster.followers().size());
+        for (int i = 0; i < staticNodeCount; i++)
+        {
+            assertEquals(2, cluster.node(i).services().length);
+        }
+
+        for (int i = 0; i < 2; i++)
+        {
+            while (!cluster.node((leader.index() + i) % staticNodeCount).allSnapshotsLoaded()) {
+                Tests.yield();
+            }
+        }
+
+        cluster.reconnectClient();
+//        messageLength = computeMaxMessageLength(newTermLength) - SESSION_HEADER_LENGTH;
+        messageLength = computeMaxMessageLength(originalTermLength) - SESSION_HEADER_LENGTH;
+        payloadLength = messageLength - SIZE_OF_INT;
+        cluster.msgBuffer().setMemory(0, payloadLength, (byte)'z');
+        crc32.reset();
+        crc32.update(cluster.msgBuffer().byteArray(), 0, payloadLength);
+        msgChecksum = (int)crc32.getValue();
+        cluster.msgBuffer().putInt(payloadLength, msgChecksum, LITTLE_ENDIAN);
+        final int thirdBatch = 5;
+        for (int i = 0; i < thirdBatch; i++)
+        {
+            cluster.pollUntilMessageSent(messageLength);
+            checksum = Hashing.hash(checksum ^ msgChecksum);
+        }
+        cluster.awaitResponseMessageCount(firstBatch + secondBatch + thirdBatch);
+
+        final int finalMessageCount = firstBatch + secondBatch + thirdBatch;
+        final long finalChecksum = checksum;
+        final Predicate<TestNode> finalServiceState =
+            (node) ->
+            {
+                final TestNode.TestService[] services = node.services();
+                return finalMessageCount == services[0].messageCount() &&
+                    finalChecksum == ((TestNode.ChecksumService)services[1]).checksum();
+            };
+
+        for (int i = 0; i < staticNodeCount; i++)
+        {
+            final TestNode node = cluster.node(i);
+            cluster.awaitNodeState(node, finalServiceState);
+        }
+    }
+
     @Test
     @InterruptAfter(180)
     void shouldRecoverWhenFollowersIsMultipleTermsBehindFromEmptyLogAndPartialLogWithoutCommittedLogEntry()
