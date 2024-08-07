@@ -1511,6 +1511,7 @@ abstract class ArchiveConductor
         }
 
         final ArrayDeque<File> deleteList = new ArrayDeque<>(files.size());
+        final long start = System.currentTimeMillis();
         for (final String name : files)
         {
             final File file = new File(archiveDir, name);
@@ -1541,6 +1542,8 @@ abstract class ArchiveConductor
                 }
             }
         }
+        final long finish = System.currentTimeMillis();
+        System.out.println("addDeleteSegmentsSession time: " + (finish - start) + " ms");
 
         final int count = deleteList.size();
 

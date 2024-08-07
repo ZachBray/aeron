@@ -17,7 +17,9 @@ package io.aeron.archive;
 
 import io.aeron.*;
 import io.aeron.archive.client.*;
+import io.aeron.archive.codecs.RecordingSignal;
 import io.aeron.archive.codecs.SourceLocation;
+import io.aeron.archive.status.RecordingPos;
 import io.aeron.driver.MediaDriver;
 import io.aeron.driver.ThreadingMode;
 import io.aeron.driver.status.SystemCounterDescriptor;
@@ -28,6 +30,9 @@ import io.aeron.test.*;
 import io.aeron.test.driver.TestMediaDriver;
 import org.agrona.*;
 import org.agrona.collections.MutableBoolean;
+import org.agrona.collections.MutableReference;
+import org.agrona.concurrent.BackoffIdleStrategy;
+import org.agrona.concurrent.IdleStrategy;
 import org.agrona.concurrent.UnsafeBuffer;
 import org.agrona.concurrent.YieldingIdleStrategy;
 import org.junit.jupiter.api.AfterEach;
@@ -39,8 +44,11 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 
 import java.io.File;
+import java.io.IOException;
 import java.util.Random;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import static io.aeron.archive.client.AeronArchive.NULL_POSITION;
@@ -160,6 +168,113 @@ class ArchiveSystemTest
             .termId(requestedStartTermId)
             .termOffset(requestedStartTermOffset)
             .build();
+    }
+
+    public static void main(String[] args) throws IOException
+    {
+        final int segmentLength = 128 * 1024 * 1024;
+        final long purgedSegmentCount = 500;
+        final long recPosition = (purgedSegmentCount + 1L) * segmentLength;
+        final long purgePosition = purgedSegmentCount * segmentLength;
+        final MutableReference<RecordingSignalConsumer> consumer = new MutableReference<>();
+        try (
+            ArchivingMediaDriver driver = ArchivingMediaDriver.launch(
+                new MediaDriver.Context(),
+                new Archive.Context()
+                    .controlChannel("aeron:udp?endpoint=localhost:10000")
+                    .replicationChannel("aeron:udp?endpoint=localhost:10001")
+                    .archiveDirectoryName("/home/zach/src/data/archive-purge-segs.bak")
+                    .segmentFileLength(segmentLength)
+            );
+            AeronArchive archive = AeronArchive.connect(
+                new AeronArchive.Context()
+                    .controlRequestChannel(AeronArchive.Configuration.localControlChannel())
+                    .controlResponseChannel("aeron:udp?endpoint=localhost:0")
+                    .recordingSignalConsumer((controlSessionId, correlationId, recordingId, subscriptionId, position, signal) ->
+                    {
+                        final RecordingSignalConsumer signalConsumer = consumer.get();
+                        if (null != signalConsumer)
+                        {
+                            signalConsumer.onSignal(controlSessionId, correlationId, recordingId, subscriptionId, position, signal);
+                        }
+                    })
+            );
+        )
+        {
+            final AtomicBoolean hasPurgedSegments = new AtomicBoolean();
+//            final long recordingId = createRecording(archive, recPosition, segmentLength);
+            final long recordingId = 3;
+
+            consumer.set((controlSessionId, correlationId, signalRecordingId, subscriptionId, position, signal) ->
+            {
+                if (signal == RecordingSignal.DELETE && signalRecordingId == recordingId)
+                {
+                    hasPurgedSegments.set(true);
+                }
+            });
+
+            // wait for ENTER key:
+            System.out.println("Press ENTER to start the purge");
+            System.in.read();
+
+            archive.purgeSegments(recordingId, purgePosition);
+
+            while (!hasPurgedSegments.get())
+            {
+                archive.pollForRecordingSignals();
+            }
+        }
+    }
+
+    private static long createRecording(final AeronArchive archive, final long minimumRecPos, final long segmentLength)
+    {
+        final IdleStrategy idleStrategy = new BackoffIdleStrategy();
+        final Random random = new Random();
+        final byte[] bytes = new byte[16 * 1024];
+        random.nextBytes(bytes);
+        final UnsafeBuffer buffer = new UnsafeBuffer(bytes);
+
+        try (ExclusivePublication publication = archive.addRecordedExclusivePublication("aeron:ipc", 1337))
+        {
+            int counterId = -1;
+
+            idleStrategy.reset();
+            while (counterId < 0) {
+                counterId = RecordingPos.findCounterIdBySession(
+                    archive.context().aeron().countersReader(),
+                    publication.sessionId(),
+                    archive.archiveId());
+
+                idleStrategy.idle();
+            }
+
+            final long recordingId =
+                RecordingPos.getRecordingId(archive.context().aeron().countersReader(), counterId);
+
+            long lastSegmentCount = 0;
+
+            while (publication.position() < minimumRecPos)
+            {
+                final long result = publication.offer(buffer, 0, buffer.capacity());
+
+                if (result < 0)
+                {
+                    idleStrategy.idle();
+
+                    long currentSegmentCount = publication.position() / segmentLength;
+                    if (currentSegmentCount > lastSegmentCount) {
+                        lastSegmentCount = currentSegmentCount;
+                        System.out.println("Published segments: " + currentSegmentCount);
+                    }
+                }
+                else
+                {
+                    idleStrategy.reset();
+                }
+            }
+
+            return recordingId;
+        }
     }
 
     @AfterEach
