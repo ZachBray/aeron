@@ -1254,6 +1254,62 @@ project(':aeron-test-support') {
     }
 }
 
+project(':aeron-deterministic-test-support') {
+    apply plugin: 'maven-publish'
+    apply plugin: 'signing'
+
+    dependencies {
+        implementation libs.agrona
+        testImplementation project(':aeron-archive')
+        testImplementation project(':aeron-cluster')
+        testImplementation project(':aeron-test-support')
+    }
+
+    java {
+        withSourcesJar()
+        withJavadocJar()
+
+        toolchain {
+            languageVersion = JavaLanguageVersion.of(JavaVersion.VERSION_21.getMajorVersion())
+        }
+
+        sourceCompatibility = JavaVersion.VERSION_21
+    }
+
+    publishing {
+        publications {
+            aeronDeterministicTestSupport(MavenPublication) {
+                from components.java
+                pom(projectPom)
+            }
+        }
+
+        repositories {
+            maven {
+                url = !isReleaseVersion ? sonatypeCentralPortalSnapshotsRepoUrl : sonatypeCentralPortalReleasesRepoUrl
+                credentials {
+                    username = sonatypeCentralPortalUsername
+                    password = sonatypeCentralPortalPassword
+                }
+            }
+        }
+    }
+
+    signing {
+        if (signingKey != null) {
+            useInMemoryPgpKeys(signingKey, signingPassword)
+        }
+        sign publishing.publications.aeronDeterministicTestSupport
+    }
+
+    tasks.named('test').configure {
+        jvmArgs('--add-opens', 'java.base/sun.nio.ch=ALL-UNNAMED')
+    }
+
+    // TODO write javadoc
+    javadoc.enabled = false
+}
+
 project(':aeron-all') {
     apply plugin: 'maven-publish'
     apply plugin: 'signing'

@@ -294,11 +294,14 @@ public final class TestCluster implements AutoCloseable
 
     public TestNode startStaticNode(final int index, final boolean cleanStart)
     {
-        return startStaticNode(index, cleanStart, serviceSupplier);
+        return startStaticNode(index, cleanStart, false, serviceSupplier);
     }
 
     public TestNode startStaticNode(
-        final int index, final boolean cleanStart, final IntFunction<TestNode.TestService[]> serviceSupplier)
+        final int index,
+        final boolean cleanStart,
+        final boolean useInvokers,
+        final IntFunction<TestNode.TestService[]> serviceSupplier)
     {
         final String baseDirName = clusterBaseDir + "-" + index;
         final String aeronDirName = CommonContext.generateRandomDirName();
@@ -318,7 +321,7 @@ public final class TestCluster implements AutoCloseable
 
         context.mediaDriverContext
             .aeronDirectoryName(aeronDirName)
-            .threadingMode(ThreadingMode.SHARED)
+            .threadingMode(useInvokers ? ThreadingMode.INVOKER : ThreadingMode.SHARED)
             .termBufferSparseFile(true)
             .senderWildcardPortRange(senderWildcardPortRanges[index])
             .receiverWildcardPortRange(receiverWildcardPortRanges[index])
@@ -335,7 +338,7 @@ public final class TestCluster implements AutoCloseable
             .localControlChannel(ARCHIVE_LOCAL_CONTROL_CHANNEL + "?alias=archiveId-" + index)
             .localControlStreamId(context.aeronArchiveContext.controlRequestStreamId())
             .recordingEventsEnabled(false)
-            .threadingMode(ArchiveThreadingMode.SHARED)
+            .threadingMode(useInvokers ? ArchiveThreadingMode.INVOKER : ArchiveThreadingMode.SHARED)
             .deleteArchiveOnStart(cleanStart)
             .segmentFileLength(archiveSegmentFileLength)
             .replicationChannel(archiveReplicationChannel(index));
@@ -362,7 +365,8 @@ public final class TestCluster implements AutoCloseable
             .timerServiceSupplier(timerServiceSupplier)
             .acceptStandbySnapshots(acceptStandbySnapshots)
             .markFileDir(markFileDir)
-            .deleteDirOnStart(cleanStart);
+            .deleteDirOnStart(cleanStart)
+            .useAgentInvoker(useInvokers);
 
         nodes[index] = new TestNode(context, dataCollector);
 

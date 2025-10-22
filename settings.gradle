@@ -8,6 +8,6 @@ include (
     'aeron-samples',
     'aeron-system-tests',
     'aeron-test-support',
+    'aeron-deterministic-test-support',
+    'aeron-deterministic-cluster-tests',
     'aeron-all')
-
-
